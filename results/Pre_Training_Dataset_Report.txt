@@ -1,0 +1,25 @@
+
+=========================================================
+          WESSAL PROJECT: DATASET SUMMARY REPORT
+=========================================================
+1. GLOBAL DATASET METRICS
+---------------------------------------------------------
+Total Video Sequences Analyzed : 94477
+Total Unique Sign Classes      : 250
+Selected Landmarks per Frame   : 118 nodes
+Engineered Feature Channels    : 708 (X, Y, dx, dy, dx2, dy2)
+Maximum Sequence Length        : 384 frames
+Final Input Tensor Shape       : (Batch_Size, 384, 708)
+
+2. STRATIFIED DATA SPLITTING (80/10/10)
+---------------------------------------------------------
+Training Set (80%)             : 75581 samples
+Validation Set (10%)           : 9448 samples
+Testing Set (10%)              : 9448 samples
+
+3. CLASS BALANCE VERIFICATION (Samples per Class)
+---------------------------------------------------------
+[Training Set]   Max: 332 | Min: 239 | Mean: 302.3
+[Validation Set] Max: 42  | Min: 30  | Mean: 37.8
+[Testing Set]    Max: 41  | Min: 30  | Mean: 37.8
+=========================================================
