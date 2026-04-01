@@ -1,97 +1,219 @@
 import tensorflow as tf
-from tensorflow.keras import layers, models
 
+class SmartMasking(tf.keras.layers.Layer):
+    def __init__(self, pad_value=-100.0, **kwargs):
+        super().__init__(**kwargs)
+        self.pad_value = pad_value
+        self.supports_masking = True
 
-def get_model(max_len, channels, num_classes, dim=64, pad_value=-100.0):
+    def compute_mask(self, inputs, mask=None):
+        is_pad = tf.math.equal(inputs, self.pad_value)
+        is_nan = tf.math.is_nan(inputs)
+        invalid = tf.math.logical_or(is_pad, is_nan)
+        return tf.math.logical_not(tf.reduce_all(invalid, axis=-1))
 
-    class MultiHeadSelfAttention(tf.keras.layers.Layer):
-        def __init__(self, dim=256, num_heads=4, dropout=0.0):
-            super().__init__()
-            self.dim = dim
-            self.num_heads = num_heads
-            self.head_dim = dim // num_heads
-            self.scale = self.head_dim ** -0.5
-            self.qkv = layers.Dense(3 * dim, use_bias=False)
-            self.drop1 = layers.Dropout(dropout)
-            self.proj = layers.Dense(dim, use_bias=False)
-            self.supports_masking = True
+    def call(self, inputs):
+        x = tf.where(tf.math.is_nan(inputs), tf.zeros_like(inputs), inputs)
+        return x
 
-        def call(self, inputs, mask=None, training=None):
-            B = tf.shape(inputs)[0]
-            T = tf.shape(inputs)[1]
+class ECA(tf.keras.layers.Layer):
+    def __init__(self, kernel_size=5, **kwargs):
+        super().__init__(**kwargs)
+        self.supports_masking = True
+        self.kernel_size = kernel_size
+        self.conv = tf.keras.layers.Conv1D(1, kernel_size=kernel_size, strides=1, padding="same", use_bias=False)
 
-            qkv = self.qkv(inputs)
-            qkv = tf.reshape(qkv, (B, T, self.num_heads, 3 * self.head_dim))
-            qkv = tf.transpose(qkv, perm=(0, 2, 1, 3))
-            q, k, v = tf.split(qkv, 3, axis=-1)
+    def call(self, inputs, mask=None):
+        nn = tf.keras.layers.GlobalAveragePooling1D()(inputs, mask=mask)
+        nn = tf.expand_dims(nn, -1)
+        nn = self.conv(nn)
+        nn = tf.squeeze(nn, -1)
+        nn = tf.nn.sigmoid(nn)
+        nn = nn[:,None,:]
+        return inputs * nn
 
-            attn = tf.matmul(q, k, transpose_b=True) * self.scale
+class LateDropout(tf.keras.layers.Layer):
+    def __init__(self, rate, noise_shape=None, start_step=0, **kwargs):
+        super().__init__(**kwargs)
+        self.supports_masking = True
+        self.rate = rate
+        self.start_step = start_step
+        self.dropout = tf.keras.layers.Dropout(rate, noise_shape=noise_shape)
+      
+    def build(self, input_shape):
+        super().build(input_shape)
+        agg = tf.VariableAggregation.ONLY_FIRST_REPLICA
+        self._train_counter = tf.Variable(0, dtype="int64", aggregation=agg, trainable=False)
 
-            if mask is not None:
-                mask_expanded = tf.cast(mask, tf.float32)[:, None, None, :]
-                attn = attn + (1.0 - mask_expanded) * (-1e9)
+    def call(self, inputs, training=False):
+        x = tf.cond(self._train_counter < self.start_step, lambda:inputs, lambda:self.dropout(inputs, training=training))
+        if training:
+            self._train_counter.assign_add(1)
+        return x
 
-            attn = tf.nn.softmax(attn, axis=-1)
-            attn = self.drop1(attn, training=training)
+class CausalDWConv1D(tf.keras.layers.Layer):
+    def __init__(self, 
+        kernel_size=17,
+        dilation_rate=1,
+        use_bias=False,
+        depthwise_initializer='glorot_uniform',
+        name='', **kwargs):
+        super().__init__(name=name,**kwargs)
+        self.causal_pad = tf.keras.layers.ZeroPadding1D((dilation_rate*(kernel_size-1),0),name=name + '_pad')
+        self.dw_conv = tf.keras.layers.DepthwiseConv1D(
+                            kernel_size,
+                            strides=1,
+                            dilation_rate=dilation_rate,
+                            padding='valid',
+                            use_bias=use_bias,
+                            depthwise_initializer=depthwise_initializer,
+                            name=name + '_dwconv')
+        self.supports_masking = True
+        
+    def call(self, inputs):
+        x = self.causal_pad(inputs)
+        x = self.dw_conv(x)
+        return x
 
-            x = tf.matmul(attn, v)
-            x = tf.transpose(x, perm=(0, 2, 1, 3))
-            x = tf.reshape(x, (B, T, self.dim))
-            return self.proj(x)
+class MultiHeadSelfAttention(tf.keras.layers.Layer):
+    def __init__(self, dim=256, num_heads=4, dropout=0, **kwargs):
+        super().__init__(**kwargs)
+        self.dim = dim
+        self.scale = self.dim ** -0.5
+        self.num_heads = num_heads
+        self.qkv = tf.keras.layers.Dense(3 * dim, use_bias=False)
+        self.drop1 = tf.keras.layers.Dropout(dropout)
+        self.proj = tf.keras.layers.Dense(dim, use_bias=False)
+        self.supports_masking = True
 
-    def TransformerBlock(dim=64, num_heads=4, expand=2, attn_dropout=0.1, drop_rate=0.1):
-        def apply(inputs):
-            x = layers.BatchNormalization(momentum=0.95)(inputs)
-            x = MultiHeadSelfAttention(dim=dim, num_heads=num_heads, dropout=attn_dropout)(x)
-            x = layers.Dropout(drop_rate, noise_shape=(None, 1, 1))(x)
-            x = layers.Add()([inputs, x])
-            attn_out = x
+    def call(self, inputs, mask=None):
+        qkv = self.qkv(inputs)
+        qkv = tf.keras.layers.Permute((2, 1, 3))(tf.keras.layers.Reshape((-1, self.num_heads, self.dim * 3 // self.num_heads))(qkv))
+        q, k, v = tf.split(qkv, [self.dim // self.num_heads] * 3, axis=-1)
 
-            x = layers.BatchNormalization(momentum=0.95)(x)
-            x = layers.Dense(dim * expand, activation="swish", use_bias=False)(x)
-            x = layers.Dense(dim, use_bias=False)(x)
-            x = layers.Dropout(drop_rate, noise_shape=(None, 1, 1))(x)
-            x = layers.Add()([attn_out, x])
-            return x
-        return apply
+        attn = tf.matmul(q, k, transpose_b=True) * self.scale
 
-    def Conv1DBlock(dim, ksize, drop_rate=0.1):
-        def apply(x):
-            shortcut = x
-            x = layers.BatchNormalization(momentum=0.95)(x)
-            x = layers.Conv1D(dim, ksize, padding="same", activation="swish", use_bias=False)(x)
-            x = layers.Dropout(drop_rate, noise_shape=(None, 1, 1))(x)
-            x = layers.Add()([shortcut, x])
-            return x
-        return apply
+        if mask is not None:
+            mask = mask[:, None, None, :]
 
-    inp = layers.Input(shape=(max_len, channels), name="input_features")
-    x = layers.Masking(mask_value=pad_value)(inp)
+        attn = tf.keras.layers.Softmax(axis=-1)(attn, mask=mask)
+        attn = self.drop1(attn)
 
-    x = layers.Dense(dim, use_bias=False, name="stem_dense")(x)
-    x = layers.BatchNormalization(momentum=0.95, name="stem_bn")(x)
+        x = attn @ v
+        x = tf.keras.layers.Reshape((-1, self.dim))(tf.keras.layers.Permute((2, 1, 3))(x))
+        x = self.proj(x)
+        return x
 
-    ksize = 17
+def Conv1DBlock(channel_size,
+          kernel_size,
+          dilation_rate=1,
+          drop_rate=0.0,
+          expand_ratio=2,
+          se_ratio=0.25,
+          activation='swish',
+          name=None):
+    if name is None:
+        name = str(tf.keras.backend.get_uid("mbblock"))
+    def apply(inputs):
+        channels_in = tf.keras.backend.int_shape(inputs)[-1]
+        channels_expand = channels_in * expand_ratio
 
-    x = Conv1DBlock(dim, ksize)(x)
-    x = Conv1DBlock(dim, ksize)(x)
-    x = Conv1DBlock(dim, ksize)(x)
+        skip = inputs
 
-    x = TransformerBlock(dim, num_heads=4, expand=2, attn_dropout=0.1, drop_rate=0.1)(x)  # head_dim = 64//4 = 16 ✓
-    x = TransformerBlock(dim, num_heads=4, expand=2, attn_dropout=0.1, drop_rate=0.1)(x)
+        x = tf.keras.layers.Dense(
+            channels_expand,
+            use_bias=True,
+            activation=activation,
+            name=name + '_expand_conv')(inputs)
 
-    x = Conv1DBlock(dim, ksize)(x)
-    x = Conv1DBlock(dim, ksize)(x)
-    x = Conv1DBlock(dim, ksize)(x)
+        x = CausalDWConv1D(kernel_size,
+            dilation_rate=dilation_rate,
+            use_bias=False,
+            name=name + '_dwconv')(x)
 
-    x = TransformerBlock(dim, num_heads=4, expand=2, attn_dropout=0.1, drop_rate=0.1)(x)  # CHANGED: 8→4, head_dim=16 ✓
-    x = TransformerBlock(dim, num_heads=4, expand=2, attn_dropout=0.1, drop_rate=0.1)(x)
+        x = tf.keras.layers.BatchNormalization(momentum=0.95, name=name + '_bn')(x)
 
-    x = layers.Dense(dim * 2, activation="swish", name="top_dense")(x)
-    x = layers.GlobalAveragePooling1D()(x)
-    x = layers.Dropout(0.4, name="top_dropout")(x)
-    x = layers.Dense(dim, activation="swish", name="pre_classifier")(x)
-    outputs = layers.Dense(num_classes, name="classifier")(x)
+        x  = ECA()(x)
 
-    model = models.Model(inputs=inp, outputs=outputs, name="transformer_model")
-    return model
+        x = tf.keras.layers.Dense(
+            channel_size,
+            use_bias=True,
+            name=name + '_project_conv')(x)
+
+        if drop_rate > 0:
+            x = tf.keras.layers.Dropout(drop_rate, noise_shape=(None,1,1), name=name + '_drop')(x)
+
+        if (channels_in == channel_size):
+            x = tf.keras.layers.add([x, skip], name=name + '_add')
+        return x
+
+    return apply
+
+def TransformerBlock(dim=256, num_heads=4, expand=4, attn_dropout=0.2, drop_rate=0.2, activation='swish'):
+    def apply(inputs):
+        x = inputs
+        x = tf.keras.layers.BatchNormalization(momentum=0.95)(x)
+        x = MultiHeadSelfAttention(dim=dim,num_heads=num_heads,dropout=attn_dropout)(x)
+        x = tf.keras.layers.Dropout(drop_rate, noise_shape=(None,1,1))(x)
+        x = tf.keras.layers.Add()([inputs, x])
+        attn_out = x
+
+        x = tf.keras.layers.BatchNormalization(momentum=0.95)(x)
+        x = tf.keras.layers.Dense(dim*expand, use_bias=False, activation=activation)(x)
+        x = tf.keras.layers.Dense(dim, use_bias=False)(x)
+        x = tf.keras.layers.Dropout(drop_rate, noise_shape=(None,1,1))(x)
+        x = tf.keras.layers.Add()([attn_out, x])
+        return x
+    return apply
+
+class SignLanguageTransformer:
+    def __init__(self, max_len=384, channels=708, num_classes=250, dim=192, pad_value=-100.0, dropout_step=0):
+        self.max_len = max_len
+        self.channels = channels
+        self.num_classes = num_classes
+        self.dim = dim
+        self.pad_value = pad_value
+        self.dropout_step = dropout_step
+
+    def build_model(self):
+        inp = tf.keras.Input((self.max_len, self.channels))
+        x = SmartMasking(pad_value=self.pad_value)(inp)
+        ksize = 17
+        x = tf.keras.layers.Dense(self.dim, use_bias=False, name='stem_conv')(x)
+        x = tf.keras.layers.BatchNormalization(momentum=0.95, name='stem_bn')(x)
+
+        x = Conv1DBlock(self.dim, ksize, drop_rate=0.2)(x)
+        x = Conv1DBlock(self.dim, ksize, drop_rate=0.2)(x)
+        x = Conv1DBlock(self.dim, ksize, drop_rate=0.2)(x)
+        x = TransformerBlock(self.dim, expand=2)(x)
+
+        x = Conv1DBlock(self.dim, ksize, drop_rate=0.2)(x)
+        x = Conv1DBlock(self.dim, ksize, drop_rate=0.2)(x)
+        x = Conv1DBlock(self.dim, ksize, drop_rate=0.2)(x)
+        x = TransformerBlock(self.dim, expand=2)(x)
+
+        if self.dim >= 384: # For the 4x sized model
+            x = Conv1DBlock(self.dim, ksize, drop_rate=0.2)(x)
+            x = Conv1DBlock(self.dim, ksize, drop_rate=0.2)(x)
+            x = Conv1DBlock(self.dim, ksize, drop_rate=0.2)(x)
+            x = TransformerBlock(self.dim, expand=2)(x)
+
+            x = Conv1DBlock(self.dim, ksize, drop_rate=0.2)(x)
+            x = Conv1DBlock(self.dim, ksize, drop_rate=0.2)(x)
+            x = Conv1DBlock(self.dim, ksize, drop_rate=0.2)(x)
+            x = TransformerBlock(self.dim, expand=2)(x)
+
+        x = tf.keras.layers.Dense(self.dim*2, activation=None, name='top_conv')(x)
+        x = tf.keras.layers.GlobalAveragePooling1D()(x)
+        x = LateDropout(0.8, start_step=self.dropout_step)(x)
+        x = tf.keras.layers.Dense(self.num_classes, name='classifier')(x)
+        
+        return tf.keras.Model(inp, x, name="SignLanguageTransformer")
+
+def get_transformer_model(input_shape=(384, 708), num_classes=250):
+    transformer = SignLanguageTransformer(
+        max_len=input_shape[0],
+        channels=input_shape[1],
+        num_classes=num_classes
+    )
+    return transformer.build_model()
