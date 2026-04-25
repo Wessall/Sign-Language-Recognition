@@ -149,16 +149,21 @@ def Conv1DBlock(channel_size,
 
     return apply
 
+
 def TransformerBlock(dim=256, num_heads=4, expand=4, attn_dropout=0.2, drop_rate=0.2, activation='swish'):
     def apply(inputs):
         x = inputs
-        x = tf.keras.layers.BatchNormalization(momentum=0.95)(x)
+        # التعديل الأول: استبدال BatchNormalization بـ LayerNormalization
+        x = tf.keras.layers.LayerNormalization(epsilon=1e-6)(x)
+        
         x = MultiHeadSelfAttention(dim=dim,num_heads=num_heads,dropout=attn_dropout)(x)
         x = tf.keras.layers.Dropout(drop_rate, noise_shape=(None,1,1))(x)
         x = tf.keras.layers.Add()([inputs, x])
         attn_out = x
 
-        x = tf.keras.layers.BatchNormalization(momentum=0.95)(x)
+        # التعديل الثاني: استبدال BatchNormalization بـ LayerNormalization
+        x = tf.keras.layers.LayerNormalization(epsilon=1e-6)(x)
+        
         x = tf.keras.layers.Dense(dim*expand, use_bias=False, activation=activation)(x)
         x = tf.keras.layers.Dense(dim, use_bias=False)(x)
         x = tf.keras.layers.Dropout(drop_rate, noise_shape=(None,1,1))(x)
@@ -208,7 +213,7 @@ class SignLanguageTransformer:
         x = LateDropout(0.8, start_step=self.dropout_step)(x)
         x = tf.keras.layers.Dense(self.num_classes, name='classifier')(x)
         
-        return tf.keras.Model(inp, x, name="SignLanguageTransformer")
+        return tf.keras.Model(inp, x, name="Transformer_Model_ASL")
 
 def get_transformer_model(input_shape=(384, 708), num_classes=250):
     transformer = SignLanguageTransformer(
